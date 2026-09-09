@@ -10,6 +10,8 @@ Requires Go 1.27.
 go build -o ses-suppression .
 ```
 
+Tagged releases publish archives for Linux, macOS, and Windows on amd64 and arm64. Create and push a semantic version tag such as `v1.0.0` to publish a GitHub release.
+
 ## Authentication
 
 The tool uses the AWS SDK default credential and region chain. It does not accept or store credentials.

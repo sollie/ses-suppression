@@ -26,11 +26,17 @@ Environment credentials such as `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, an
 ## Usage
 
 ```sh
-./ses-suppression list [--reason bounce|complaint|all] [--output table|json]
-./ses-suppression clear [--reason bounce|complaint|all] [--output table|json] [--delete-interval 1s] [--yes]
+./ses-suppression list [--reason bounce|complaint|all] [--after RFC3339] [--before RFC3339] [--output table|json]
+./ses-suppression clear [--reason bounce|complaint|all] [--after RFC3339] [--before RFC3339] [--output table|json] [--delete-interval 1s] [--verify=false] [--yes]
 ```
 
 When `--reason` is omitted, the tool prompts for `bounce`, `complaint`, or `all`. Results are tables by default; use `--output json` for JSON. Prompts and errors are written to stderr.
+
+`--after`/`--before` filter by `LastUpdateTime` (when the address was added to or last confirmed on the suppression list), using SESv2's native `StartDate`/`EndDate` parameters. Use them to target a date range, e.g. only clearing entries older than 90 days:
+
+```sh
+./ses-suppression clear --reason bounce --before "$(date -u -d '-90 days' +%Y-%m-%dT%H:%M:%SZ)" --yes
+```
 
 Clearing is a dry run unless `--yes` is passed:
 
@@ -42,6 +48,10 @@ Clearing is a dry run unless `--yes` is passed:
 
 The account-level suppression list supports the `BOUNCE` and `COMPLAINT` reasons. Listing follows all AWS pagination tokens. Deletion is performed sequentially and the command exits nonzero if any address cannot be deleted.
 
+Note on the AWS API: SESv2 does not distinguish "hard" vs. "soft" bounces or expose a TTL for suppression entries. Only bounces AWS classifies as permanent (plus complaints) are added to the account-level list in the first place, and entries never expire on their own — the only way an address leaves the list is an explicit `DeleteSuppressedDestination` call, which is what `clear` performs.
+
+By default, after each successful delete the tool calls `GetSuppressedDestination` to confirm the address is actually gone (expecting a not-found response), rather than trusting a nil error from the delete call. An address that is deleted but still resolves is reported as a failure. Pass `--verify=false` to skip this extra API call per address and speed up large clears.
+
 Deletes are spaced one second apart by default to avoid SES API throttling. The AWS SDK also retries transient failures up to 10 times with backoff. Adjust the interval if your account needs a slower or faster rate:
 
 ```sh
@@ -52,4 +62,4 @@ Table output prints each address as it is deleted or fails, followed by the fina
 
 ## IAM
 
-The caller needs `ses:ListSuppressedDestinations`. Actual clearing also needs `ses:DeleteSuppressedDestination`.
+The caller needs `ses:ListSuppressedDestinations`. Clearing also needs `ses:DeleteSuppressedDestination`, plus `ses:GetSuppressedDestination` unless `--verify=false` is used.

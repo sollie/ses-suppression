@@ -235,7 +235,6 @@ func displayOrDash(value string) string {
 	return value
 }
 
-
 func selectReason(value string, in io.Reader, out io.Writer) (string, []types.SuppressionListReason, error) {
 	if value == "" {
 		if _, err := fmt.Fprintln(out, "Select reason: 1) bounce  2) complaint  3) all"); err != nil {

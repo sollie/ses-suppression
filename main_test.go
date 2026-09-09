@@ -16,8 +16,8 @@ import (
 )
 
 type fakeSES struct {
-	pages       []*sesv2.ListSuppressedDestinationsOutput
-	listInputs  []*sesv2.ListSuppressedDestinationsInput
+	pages        []*sesv2.ListSuppressedDestinationsOutput
+	listInputs   []*sesv2.ListSuppressedDestinationsInput
 	deleted      []string
 	deleteError  map[string]error
 	getError     map[string]error

@@ -24,6 +24,7 @@ import (
 type sesAPI interface {
 	ListSuppressedDestinations(context.Context, *sesv2.ListSuppressedDestinationsInput, ...func(*sesv2.Options)) (*sesv2.ListSuppressedDestinationsOutput, error)
 	DeleteSuppressedDestination(context.Context, *sesv2.DeleteSuppressedDestinationInput, ...func(*sesv2.Options)) (*sesv2.DeleteSuppressedDestinationOutput, error)
+	GetSuppressedDestination(context.Context, *sesv2.GetSuppressedDestinationInput, ...func(*sesv2.Options)) (*sesv2.GetSuppressedDestinationOutput, error)
 }
 
 type destination struct {
@@ -35,6 +36,8 @@ type destination struct {
 type listResult struct {
 	Region       string        `json:"region"`
 	Reason       string        `json:"reason"`
+	After        string        `json:"after,omitempty"`
+	Before       string        `json:"before,omitempty"`
 	Count        int           `json:"count"`
 	Destinations []destination `json:"destinations"`
 }
@@ -47,7 +50,10 @@ type clearFailure struct {
 type clearResult struct {
 	Region       string         `json:"region"`
 	Reason       string         `json:"reason"`
+	After        string         `json:"after,omitempty"`
+	Before       string         `json:"before,omitempty"`
 	DryRun       bool           `json:"dryRun"`
+	Verified     bool           `json:"verified"`
 	Matched      int            `json:"matched"`
 	Deleted      int            `json:"deleted"`
 	Destinations []destination  `json:"destinations,omitempty"`
@@ -78,16 +84,19 @@ func main() {
 
 func run(ctx context.Context, args []string, in io.Reader, out, errOut io.Writer) (*commandResult, error) {
 	if len(args) == 0 || (args[0] != "list" && args[0] != "clear") {
-		return nil, errors.New("usage: ses-suppression <list|clear> [--reason bounce|complaint|all] [--output table|json] [--delete-interval 1s] [--yes]")
+		return nil, errors.New("usage: ses-suppression <list|clear> [--reason bounce|complaint|all] [--after RFC3339] [--before RFC3339] [--output table|json] [--delete-interval 1s] [--verify] [--yes]")
 	}
 
 	command := args[0]
 	flags := flag.NewFlagSet(command, flag.ContinueOnError)
 	flags.SetOutput(errOut)
 	reasonFlag := flags.String("reason", "", "bounce, complaint, or all")
+	afterFlag := flags.String("after", "", "only include addresses last updated on or after this RFC3339 timestamp")
+	beforeFlag := flags.String("before", "", "only include addresses last updated before this RFC3339 timestamp")
 	output := flags.String("output", "table", "table or json")
 	yes := flags.Bool("yes", false, "perform deletions (clear only)")
 	deleteInterval := flags.Duration("delete-interval", time.Second, "minimum delay between deletions")
+	verify := flags.Bool("verify", true, "confirm each address is actually removed after deletion (clear only)")
 	if err := flags.Parse(args[1:]); err != nil {
 		return nil, err
 	}
@@ -99,6 +108,11 @@ func run(ctx context.Context, args []string, in io.Reader, out, errOut io.Writer
 	}
 	if *deleteInterval < 0 {
 		return nil, errors.New("delete-interval must not be negative")
+	}
+
+	after, before, err := parseDateRange(*afterFlag, *beforeFlag)
+	if err != nil {
+		return nil, err
 	}
 
 	reason, reasons, err := selectReason(*reasonFlag, in, errOut)
@@ -114,12 +128,12 @@ func run(ctx context.Context, args []string, in io.Reader, out, errOut io.Writer
 	}
 
 	client := sesv2.NewFromConfig(cfg)
-	destinations, err := listDestinations(ctx, client, reasons)
+	destinations, err := listDestinations(ctx, client, reasons, after, before)
 	if err != nil {
 		return nil, fmt.Errorf("list suppressed destinations: %w", err)
 	}
 	if command == "list" {
-		return &commandResult{format: *output, value: listResult{Region: cfg.Region, Reason: reason, Count: len(destinations), Destinations: destinations}}, nil
+		return &commandResult{format: *output, value: listResult{Region: cfg.Region, Reason: reason, After: formatTime(after), Before: formatTime(before), Count: len(destinations), Destinations: destinations}}, nil
 	}
 	var progress func(destination, error) error
 	if *output == "table" && *yes {
@@ -139,8 +153,32 @@ func run(ctx context.Context, args []string, in io.Reader, out, errOut io.Writer
 			return writeErr
 		}
 	}
-	result, err := clearDestinations(ctx, client, cfg.Region, reason, destinations, !*yes, *deleteInterval, progress)
+	result, err := clearDestinations(ctx, client, cfg.Region, reason, destinations, !*yes, *deleteInterval, *verify, progress)
+	result.After = formatTime(after)
+	result.Before = formatTime(before)
 	return &commandResult{format: *output, value: result}, err
+}
+
+func parseDateRange(after, before string) (*time.Time, *time.Time, error) {
+	var afterTime, beforeTime *time.Time
+	if after != "" {
+		parsed, err := time.Parse(time.RFC3339, after)
+		if err != nil {
+			return nil, nil, fmt.Errorf("after must be an RFC3339 timestamp: %w", err)
+		}
+		afterTime = &parsed
+	}
+	if before != "" {
+		parsed, err := time.Parse(time.RFC3339, before)
+		if err != nil {
+			return nil, nil, fmt.Errorf("before must be an RFC3339 timestamp: %w", err)
+		}
+		beforeTime = &parsed
+	}
+	if afterTime != nil && beforeTime != nil && !afterTime.Before(*beforeTime) {
+		return nil, nil, errors.New("after must be earlier than before")
+	}
+	return afterTime, beforeTime, nil
 }
 
 func render(out io.Writer, format string, value any) error {
@@ -151,10 +189,10 @@ func render(out io.Writer, format string, value any) error {
 	table := tabwriter.NewWriter(out, 0, 4, 2, ' ', 0)
 	switch result := value.(type) {
 	case listResult:
-		if _, err := fmt.Fprintln(table, "REGION\tFILTER\tCOUNT"); err != nil {
+		if _, err := fmt.Fprintln(table, "REGION\tFILTER\tAFTER\tBEFORE\tCOUNT"); err != nil {
 			return err
 		}
-		if _, err := fmt.Fprintf(table, "%s\t%s\t%d\n\nEMAIL\tREASON\tLAST UPDATE\n", result.Region, result.Reason, result.Count); err != nil {
+		if _, err := fmt.Fprintf(table, "%s\t%s\t%s\t%s\t%d\n\nEMAIL\tREASON\tLAST UPDATE\n", result.Region, result.Reason, displayOrDash(result.After), displayOrDash(result.Before), result.Count); err != nil {
 			return err
 		}
 		for _, item := range result.Destinations {
@@ -178,10 +216,10 @@ func render(out io.Writer, format string, value any) error {
 				return err
 			}
 		}
-		if _, err := fmt.Fprintln(table, "REGION\tFILTER\tDRY RUN\tMATCHED\tDELETED\tFAILED"); err != nil {
+		if _, err := fmt.Fprintln(table, "REGION\tFILTER\tAFTER\tBEFORE\tDRY RUN\tVERIFIED\tMATCHED\tDELETED\tFAILED"); err != nil {
 			return err
 		}
-		if _, err := fmt.Fprintf(table, "%s\t%s\t%t\t%d\t%d\t%d\n", result.Region, result.Reason, result.DryRun, result.Matched, result.Deleted, len(result.Failures)); err != nil {
+		if _, err := fmt.Fprintf(table, "%s\t%s\t%s\t%s\t%t\t%t\t%d\t%d\t%d\n", result.Region, result.Reason, displayOrDash(result.After), displayOrDash(result.Before), result.DryRun, result.Verified, result.Matched, result.Deleted, len(result.Failures)); err != nil {
 			return err
 		}
 	default:
@@ -189,6 +227,14 @@ func render(out io.Writer, format string, value any) error {
 	}
 	return table.Flush()
 }
+
+func displayOrDash(value string) string {
+	if value == "" {
+		return "-"
+	}
+	return value
+}
+
 
 func selectReason(value string, in io.Reader, out io.Writer) (string, []types.SuppressionListReason, error) {
 	if value == "" {
@@ -225,8 +271,8 @@ func selectReason(value string, in io.Reader, out io.Writer) (string, []types.Su
 	}
 }
 
-func listDestinations(ctx context.Context, client sesAPI, reasons []types.SuppressionListReason) ([]destination, error) {
-	input := &sesv2.ListSuppressedDestinationsInput{Reasons: reasons, PageSize: aws.Int32(1000)}
+func listDestinations(ctx context.Context, client sesAPI, reasons []types.SuppressionListReason, after, before *time.Time) ([]destination, error) {
+	input := &sesv2.ListSuppressedDestinationsInput{Reasons: reasons, PageSize: aws.Int32(1000), StartDate: after, EndDate: before}
 	var destinations []destination
 	for {
 		output, err := client.ListSuppressedDestinations(ctx, input)
@@ -254,8 +300,8 @@ func formatTime(value *time.Time) string {
 	return value.UTC().Format(time.RFC3339)
 }
 
-func clearDestinations(ctx context.Context, client sesAPI, region, reason string, destinations []destination, dryRun bool, interval time.Duration, progress func(destination, error) error) (clearResult, error) {
-	result := clearResult{Region: region, Reason: reason, DryRun: dryRun, Matched: len(destinations)}
+func clearDestinations(ctx context.Context, client sesAPI, region, reason string, destinations []destination, dryRun bool, interval time.Duration, verify bool, progress func(destination, error) error) (clearResult, error) {
+	result := clearResult{Region: region, Reason: reason, DryRun: dryRun, Verified: verify && !dryRun, Matched: len(destinations)}
 	if dryRun {
 		result.Destinations = destinations
 		return result, nil
@@ -272,6 +318,9 @@ func clearDestinations(ctx context.Context, client sesAPI, region, reason string
 			}
 		}
 		_, err := client.DeleteSuppressedDestination(ctx, &sesv2.DeleteSuppressedDestinationInput{EmailAddress: aws.String(item.EmailAddress)})
+		if err == nil && verify {
+			err = verifyRemoved(ctx, client, item.EmailAddress)
+		}
 		if err != nil {
 			result.Failures = append(result.Failures, clearFailure{EmailAddress: item.EmailAddress, Error: err.Error()})
 			if progress != nil {
@@ -292,4 +341,19 @@ func clearDestinations(ctx context.Context, client sesAPI, region, reason string
 		return result, fmt.Errorf("failed to delete %d of %d destinations", len(result.Failures), result.Matched)
 	}
 	return result, nil
+}
+
+// verifyRemoved confirms an address no longer appears in the suppression list
+// after a successful delete call, satisfying the "address is actually gone"
+// success criteria rather than trusting a nil error from DeleteSuppressedDestination.
+func verifyRemoved(ctx context.Context, client sesAPI, emailAddress string) error {
+	_, err := client.GetSuppressedDestination(ctx, &sesv2.GetSuppressedDestinationInput{EmailAddress: aws.String(emailAddress)})
+	if err == nil {
+		return errors.New("address still present in suppression list after delete")
+	}
+	var notFound *types.NotFoundException
+	if errors.As(err, &notFound) {
+		return nil
+	}
+	return fmt.Errorf("verify removal: %w", err)
 }

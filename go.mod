@@ -5,7 +5,7 @@ go 1.27
 tool golang.org/x/vuln/cmd/govulncheck
 
 require (
-	github.com/aws/aws-sdk-go-v2 v1.46.0
+	github.com/aws/aws-sdk-go-v2 v1.47.0
 	github.com/aws/aws-sdk-go-v2/config v1.33.3
 	github.com/aws/aws-sdk-go-v2/service/sesv2 v1.72.0
 )
